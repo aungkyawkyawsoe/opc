@@ -383,10 +383,31 @@ print_qr() {
 }
 
 mint_remote_link() {
-  local out link i
-  local -a waits=(200 60 30)
+  local out link i public
+  local -a waits=(60 30 30)
+
+  # Fast path: if the service already advertises its public URL, mint the
+  # pairing code locally and just prefix it. This avoids `pair --remote`
+  # waiting up to 3 minutes for tunnel readiness.
+  public=$(remote_url || true)
+  if [ -n "$public" ]; then
+    info "minting pairing link for ${public}..."
+    out=$(oc 30 pair --url "$public" 2>&1 </dev/null) || true
+    link=$(printf '%s\n' "$out" | extract_link)
+    if [ -n "$link" ]; then
+      save_link "$link"
+      capture_qr "$out"
+      printf '%s\n' "$public" >"$PUBLIC_FILE"
+      printf '%s\n' "$link"
+      return 0
+    fi
+    if [ -n "$out" ]; then
+      printf '%s%s%s\n' "$DIM" "$(printf '%s' "$out" | head -c 300)" "$RESET" >&2
+    fi
+  fi
+
   for i in 1 2 3; do
-    info "requesting pairing link (attempt ${i}/3)..."
+    info "requesting pairing link via remote (attempt ${i}/3)..."
     out=$(oc "${waits[$((i - 1))]}" pair --remote 2>&1 </dev/null) || true
     link=$(printf '%s\n' "$out" | extract_link)
     if [ -n "$link" ]; then
@@ -916,6 +937,9 @@ cmd_doctor() {
   PORT=${cfgport:-$DEFAULT_PORT}
   health=$(service_http_code)
   say "health     ${health:-000} on port ${PORT}"
+  if [ "$health" = "200" ] || [ "$health" = "401" ]; then
+    say "public     $(remote_url || echo 'not advertised')"
+  fi
 
   for p in 49374 49375 49376 49377; do
     pid=$(listener_pid_for "$p")
