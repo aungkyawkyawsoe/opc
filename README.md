@@ -51,6 +51,7 @@ opc start --port auto      # allocate a new instance on the next free port
 opc qr                     # fresh one-time link + QR for the OpenCode app
 opc link                   # fresh one-time link only
 opc status                 # state + cached link TTL, no changes
+opc doctor                 # diagnostics: CLI, version, port ownership, network
 opc restart                # new link (OpenTunnel) / restart tunnel (cloudflared)
 opc stop                   # disable remote access (restarts local service)
 opc stop --all             # disable remote access and stop the service
@@ -74,6 +75,17 @@ Options: `--cloudflared`, `--tunnel <opentunnel|cloudflared>`, `--protocol <auto
 - **Servers**: install system-wide as root (`./install.sh` → `/usr/local/bin`), then run `opc start` over SSH. The table and login link are printed; scan the QR on the server terminal or use `opc qr`.
 - **Across devices**: install `opc` on each machine; each copy manages that machine's OpenCode service. To add a phone/tablet/another browser, run `opc qr` and scan the new link. The OpenTunnel address stays the same across restarts.
 - **No hangs**: every `opencode` CLI call has a timeout, so a port conflict or a stuck service discovery fails fast with a message instead of blocking.
+
+## Troubleshooting
+
+If `opc start` takes long:
+
+1. `opc doctor` — shows the OpenCode CLI path/version, configured port, port ownership, OpenTunnel reachability, and health.
+2. `opc start --no-link` — brings up the service and tunnel without minting a link. If the table appears in ~1s, only pairing was slow.
+3. If `:49374` is owned by another account, `opc` moves automatically; force a port with `opc start --port 49375`.
+4. If doctor says `opentunnel UNREACHABLE`, outbound HTTPS is blocked on that host; `--cloudflared` only works for API clients (the web UI needs SSE).
+
+Progress messages go to stderr, so `opc start 2>/dev/null` prints only the table and link.
 
 ## Joining from a browser or the mobile app
 

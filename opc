@@ -55,7 +55,7 @@ else
 fi
 
 say()  { printf '%s\n' "$*"; }
-info() { printf '%s%s%s\n' "$DIM" "$*" "$RESET"; }
+info() { printf '%s%s%s\n' "$DIM" "$*" "$RESET" >&2; }
 warn() { printf '%s!%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
 err()  { printf '%serror:%s %s\n' "$RED" "$RESET" "$*" >&2; }
 die()  { err "$*"; exit 1; }
@@ -73,15 +73,24 @@ elif command -v gtimeout >/dev/null 2>&1; then
   TIMEOUT_BIN=gtimeout
 fi
 
+TIMEOUT_KILL=()
+if [ -n "$TIMEOUT_BIN" ] && "$TIMEOUT_BIN" -k 1 1 true >/dev/null 2>&1; then
+  TIMEOUT_KILL=(-k 5)
+fi
+
 oc() {
   local secs=$1
   shift
   if [ -n "$TIMEOUT_BIN" ]; then
-    "$TIMEOUT_BIN" "$secs" opencode "$@"
+    "$TIMEOUT_BIN" "${TIMEOUT_KILL[@]}" "$secs" opencode "$@"
   else
     opencode "$@"
   fi
 }
+
+if [ "${OPC_DEBUG:-0}" = "1" ]; then
+  set -x
+fi
 
 usage() {
   cat <<EOF
@@ -93,6 +102,7 @@ ${BOLD}USAGE${RESET}
 ${BOLD}COMMANDS${RESET}
   start      ensure service + tunnel, print access table with a login link
   status     show current state (no changes)
+  doctor     print diagnostics (user, CLI, port ownership, config)
   link       mint a fresh one-time login link
   qr         print a scannable QR code for the OpenCode mobile app
   restart    restart the tunnel (cloudflared) or refresh the link (OpenTunnel)
@@ -154,6 +164,8 @@ lock_state() {
     if mkdir "$LOCK_DIR" 2>/dev/null; then
       printf '%s\n' "$$" >"$LOCK_DIR/pid"
       trap 'rm -rf "$LOCK_DIR"' EXIT
+      trap 'exit 130' INT
+      trap 'exit 143' TERM
       return 0
     fi
     pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
@@ -351,6 +363,12 @@ save_link() {
   date +%s >"$LINK_TS_FILE"
 }
 
+opentunnel_reachable() {
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://opentunnel.xyz/ 2>/dev/null || true)
+  [ -n "$code" ] && [ "$code" != "000" ]
+}
+
 capture_qr() {
   printf '%s\n' "$1" |
     sed -n '/^[[:space:]]*[█▀▄][█▀▄ ]*$/p' >"$QR_FILE" 2>/dev/null || true
@@ -366,8 +384,10 @@ print_qr() {
 
 mint_remote_link() {
   local out link i
+  local -a waits=(200 60 30)
   for i in 1 2 3; do
-    out=$(oc 200 pair --remote 2>&1) || true
+    info "requesting pairing link (attempt ${i}/3)..."
+    out=$(oc "${waits[$((i - 1))]}" pair --remote 2>&1 </dev/null) || true
     link=$(printf '%s\n' "$out" | extract_link)
     if [ -n "$link" ]; then
       save_link "$link"
@@ -376,17 +396,23 @@ mint_remote_link() {
       printf '%s\n' "$link"
       return 0
     fi
-    sleep 2
+    if [ -n "$out" ]; then
+      printf '%s%s%s\n' "$DIM" "$(printf '%s' "$out" | head -c 300)" "$RESET" >&2
+    fi
+    sleep 1
   done
   return 1
 }
 
 ensure_remote_link() {
   local out link
+  if ! opentunnel_reachable; then
+    die "cannot reach https://opentunnel.xyz - check outbound HTTPS/DNS, or use '${PROG} start --cloudflared' for API-only access"
+  fi
   link=""
   if ! remote_enabled; then
     info "enabling OpenTunnel remote access (OpenCode service restarts)..."
-    out=$(oc 200 pair --remote --yes 2>&1) || true
+    out=$(oc 200 pair --remote --yes 2>&1 </dev/null) || true
     link=$(printf '%s\n' "$out" | extract_link)
     detect_service
     ensure_service
@@ -748,7 +774,12 @@ cmd_start() {
       LINK=$(mint_tunnel_link || true)
     fi
   else
-    LINK=$(ensure_remote_link) || LINK=""
+    if [ "$DO_LINK" = 1 ]; then
+      LINK=$(ensure_remote_link) || LINK=""
+    elif ! remote_enabled; then
+      # enabling remote necessarily provisions a pairing code; discard it
+      ensure_remote_link >/dev/null || true
+    fi
     PUBLIC_URL=$(remote_url || true)
     if [ -z "$PUBLIC_URL" ]; then
       die "OpenTunnel is not ready - run: opencode pair --remote --yes"
@@ -854,6 +885,54 @@ cmd_stop() {
   rm -f "$LINK_FILE" "$LINK_TS_FILE" "$PUBLIC_FILE" "$MODE_FILE"
 }
 
+cmd_doctor() {
+  init_state
+  local cfgport host remote ver health pid owner state p
+  say "${BOLD}opc doctor${RESET}"
+  say "user       $(id -un) (uid $(id -u))"
+  say "home       $HOME"
+  say "shell      ${SHELL:-unknown}"
+  say "state      $STATE_DIR"
+  if command -v opencode >/dev/null 2>&1; then
+    say "opencode   $(command -v opencode)"
+    ver=$(oc 10 --version 2>&1 | head -1)
+    say "version    ${ver:-unknown}"
+  else
+    say "opencode   NOT FOUND in PATH"
+  fi
+
+  cfgport=$(oc 10 service get port 2>/dev/null || true)
+  host=$(oc 10 service get hostname 2>/dev/null || true)
+  remote=$(oc 10 service get remote 2>/dev/null || true)
+  say "config     $HOME/.config/opencode"
+  say "port       ${cfgport:-$DEFAULT_PORT (default)}"
+  say "hostname   ${host:-127.0.0.1 (default)}"
+  say "remote     ${remote:-false}"
+  if opentunnel_reachable; then
+    say "opentunnel  reachable"
+  else
+    say "opentunnel  UNREACHABLE"
+  fi
+  PORT=${cfgport:-$DEFAULT_PORT}
+  health=$(service_http_code)
+  say "health     ${health:-000} on port ${PORT}"
+
+  for p in 49374 49375 49376 49377; do
+    pid=$(listener_pid_for "$p")
+    if [ -n "$pid" ]; then
+      owner=$(owner_of_pid "$pid")
+      if [ "$owner" = "$(id -u)" ]; then state="you"; else state="uid ${owner:-?}"; fi
+      say "listener   :${p} pid ${pid} (${state})"
+    elif port_listening "$p"; then
+      say "listener   :${p} (owner unknown)"
+    else
+      say "listener   :${p} free"
+    fi
+  done
+  say "timeout    ${TIMEOUT_BIN:-none}"
+  say "link left  $(link_remaining)s"
+}
+
 cmd_logs() {
   init_state
   detect_service
@@ -933,6 +1012,7 @@ esac
 case $CMD in
   start) lock_state; cmd_start ;;
   status) lock_state; cmd_status ;;
+  doctor) cmd_doctor ;;
   link) lock_state; cmd_link ;;
   qr) lock_state; cmd_qr ;;
   restart) lock_state; cmd_restart ;;
