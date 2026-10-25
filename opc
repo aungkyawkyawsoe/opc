@@ -1,0 +1,838 @@
+#!/usr/bin/env bash
+#
+# opc - one-stop remote access for OpenCode
+#
+# Default backend is OpenTunnel, the built-in end-to-end encrypted tunnel
+# managed by the OpenCode service. It supports streaming (SSE), so the web
+# UI works.
+#
+# --cloudflared is kept as an option, but Cloudflare quick tunnels buffer
+# text/event-stream responses, which leaves the web UI stuck on "Loading".
+#
+# Requires: opencode, curl, ss (iproute2), ip
+#
+set -uo pipefail
+
+PROG=${0##*/}
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/opc
+LOG_FILE=$STATE_DIR/tunnel.log
+PID_FILE=$STATE_DIR/tunnel.pid
+URL_FILE=$STATE_DIR/tunnel.url
+PROTO_FILE=$STATE_DIR/tunnel.protocol
+MODE_FILE=$STATE_DIR/mode
+PUBLIC_FILE=$STATE_DIR/public.url
+LINK_FILE=$STATE_DIR/link
+LINK_TS_FILE=$STATE_DIR/link.ts
+QR_FILE=$STATE_DIR/qr.txt
+LOCK_DIR=$STATE_DIR/lock.d
+DEFAULT_PORT=49374
+DEFAULT_PROTOCOL=auto
+PAIR_TTL=300 # seconds, pairing codes live 5 minutes
+
+MODE=opentunnel
+PROTOCOL=${OPC_PROTOCOL:-$DEFAULT_PROTOCOL}
+TIMEOUT=${OPC_TIMEOUT:-45}
+DO_LINK=1
+DO_QR=auto
+SHOW_QR=0
+WANT_LAN=0
+WANT_ALL=0
+PORT_WANT=
+PUBLIC_URL=
+LINK=
+
+# ---------------------------------------------------------------- output ---
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  BOLD=$(tput bold 2>/dev/null || true)
+  DIM=$(tput dim 2>/dev/null || true)
+  RED=$(tput setaf 1 2>/dev/null || true)
+  GREEN=$(tput setaf 2 2>/dev/null || true)
+  YELLOW=$(tput setaf 3 2>/dev/null || true)
+  RESET=$(tput sgr0 2>/dev/null || true)
+else
+  BOLD='' DIM='' RED='' GREEN='' YELLOW='' RESET=''
+fi
+
+say()  { printf '%s\n' "$*"; }
+info() { printf '%s%s%s\n' "$DIM" "$*" "$RESET"; }
+warn() { printf '%s!%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
+err()  { printf '%serror:%s %s\n' "$RED" "$RESET" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"
+}
+
+usage() {
+  cat <<EOF
+${BOLD}${PROG}${RESET} - one-stop OpenCode remote access (tunnel + pairing)
+
+${BOLD}USAGE${RESET}
+  ${PROG} <command> [options]
+
+${BOLD}COMMANDS${RESET}
+  start      ensure service + tunnel, print access table with a login link
+  status     show current state (no changes)
+  link       mint a fresh one-time login link
+  qr         print a scannable QR code for the OpenCode mobile app
+  restart    restart the tunnel (cloudflared) or refresh the link (OpenTunnel)
+  stop       disable remote access (--all also stops the OpenCode service)
+  logs       follow the tunnel / service log
+  help       show this help
+
+${BOLD}OPTIONS${RESET}
+  --cloudflared                 use a Cloudflare quick tunnel instead of OpenTunnel
+                                (web UI will NOT load: Cloudflare buffers SSE)
+  --tunnel <opentunnel|cloudflared>
+  --protocol <auto|http2|quic>  protocol for the cloudflared backend
+  --timeout <seconds>           cloudflared startup timeout (default: ${TIMEOUT})
+  --port <port>                 set the managed service port and restart it
+  --lan                         bind the service to 0.0.0.0 (restarts it)
+  --no-link                     do not print a login link
+  --qr                          show a scannable QR code (default on a terminal)
+  --no-qr                       hide the QR code
+  --all                         with stop: also stop the OpenCode service
+  -h, --help                    show help
+
+${BOLD}EXAMPLES${RESET}
+  ${PROG} start
+  ${PROG} start --lan
+  ${PROG} qr
+  ${PROG} link
+  ${PROG} status
+  ${PROG} stop --all
+
+${BOLD}NOTES${RESET}
+  - Default backend: OpenTunnel, managed by OpenCode. The public address is
+    stable and traffic is end-to-end encrypted.
+  - The login link is single-use and expires after 5 minutes. A paired
+    browser stays signed in for 30 days (session cookie).
+  - OpenCode mobile app: scan the QR from '${PROG} qr' (or the QR shown by
+    start on a terminal), or paste the login link into its server field.
+    Each device pairs once and then stays connected.
+  - OpenTunnel needs remote access enabled once; the first start accepts it
+    and restarts the OpenCode service.
+  - Cloudflare quick tunnels buffer text/event-stream (SSE), so the web UI
+    stays on "Loading". Use --cloudflared only for non-streaming clients.
+  - State and logs live in ${STATE_DIR}.
+EOF
+}
+
+# ----------------------------------------------------------------- state ---
+
+init_state() {
+  umask 077
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR" 2>/dev/null || true
+}
+
+lock_state() {
+  init_state
+  local i pid
+  for i in 1 2 3; do
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      printf '%s\n' "$$" >"$LOCK_DIR/pid"
+      trap 'rm -rf "$LOCK_DIR"' EXIT
+      return 0
+    fi
+    pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+    if [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+      die "another ${PROG} command is running (pid ${pid})"
+    fi
+    rm -rf "$LOCK_DIR"
+  done
+  die "could not acquire lock at ${LOCK_DIR}"
+}
+
+# --------------------------------------------------------------- service ---
+
+svc_url() {
+  opencode service status 2>/dev/null | grep -oE 'https?://[^[:space:]]+' | head -1
+}
+
+service_http_code() {
+  curl -s -o /dev/null -w '%{http_code}' --max-time 2 \
+    "http://127.0.0.1:${PORT}/api/info" 2>/dev/null || true
+}
+
+detect_service() {
+  local u cfg
+  u=$(svc_url || true)
+  if [ -n "$u" ]; then
+    SVC_HOST=${u#*://}
+    SVC_HOST=${SVC_HOST%:*}
+    PORT=${u##*:}
+  else
+    cfg=$(opencode service get port 2>/dev/null || true)
+    if [[ $cfg =~ ^[0-9]+$ ]]; then
+      PORT=$cfg
+    else
+      PORT=${PORT:-$DEFAULT_PORT}
+    fi
+    SVC_HOST=$(opencode service get hostname 2>/dev/null || true)
+    [ -n "$SVC_HOST" ] || SVC_HOST=127.0.0.1
+  fi
+  [[ $PORT =~ ^[0-9]+$ ]] || PORT=$DEFAULT_PORT
+}
+
+service_pid() {
+  ss -ltnp 2>/dev/null |
+    awk -v p=":${PORT}\$" '$4 ~ p {print}' |
+    grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2
+}
+
+service_is_up() {
+  local code
+  code=$(service_http_code)
+  [ "$code" = 200 ] || [ "$code" = 401 ]
+}
+
+ensure_service() {
+  if ! service_is_up; then
+    info "starting OpenCode service..."
+    opencode service start >/dev/null 2>&1 || true
+    local i
+    for i in $(seq 1 60); do
+      service_is_up && break
+      sleep 0.5
+    done
+  fi
+  if ! service_is_up; then
+    err "OpenCode service is not healthy on port ${PORT}."
+    err "Try: opencode service restart   (then run ${PROG} start again)"
+    exit 1
+  fi
+}
+
+apply_config() {
+  local cur_host
+
+  if [ -n "$PORT_WANT" ]; then
+    if [ "$PORT_WANT" != "${PORT}" ]; then
+      info "setting service port to ${PORT_WANT} (service will restart)..."
+      opencode service set port "$PORT_WANT" >/dev/null 2>&1 ||
+        die "could not set service port (is a managed service configured?)"
+      PORT=$PORT_WANT
+    fi
+  fi
+
+  if [ "$WANT_LAN" = 1 ]; then
+    cur_host=$(opencode service get hostname 2>/dev/null || true)
+    if [ "$cur_host" != "0.0.0.0" ] && [ "$cur_host" != "::" ] && [ "$cur_host" != ":::" ]; then
+      info "binding service to all interfaces (service will restart)..."
+      opencode service set hostname 0.0.0.0 >/dev/null 2>&1 ||
+        die "could not set service hostname"
+    fi
+  fi
+}
+
+# ------------------------------------------------------------- OpenTunnel ---
+
+remote_enabled() {
+  [ "$(opencode service get remote 2>/dev/null || true)" = "true" ]
+}
+
+extract_link() {
+  grep -oE 'https://[^[:space:]]+/auth/connect/[A-Za-z0-9_-]+' | head -1 || true
+}
+
+remote_url() {
+  opencode api get /api/info 2>/dev/null |
+    grep -oE '"https://[^"]+"' | tr -d '"' | head -1 || true
+}
+
+save_link() {
+  printf '%s\n' "$1" >"$LINK_FILE"
+  date +%s >"$LINK_TS_FILE"
+}
+
+capture_qr() {
+  printf '%s\n' "$1" |
+    sed -n '/^[[:space:]]*[█▀▄][█▀▄ ]*$/p' >"$QR_FILE" 2>/dev/null || true
+  [ -s "$QR_FILE" ] || rm -f "$QR_FILE"
+}
+
+print_qr() {
+  [ -s "$QR_FILE" ] || return 1
+  printf '\n%sScan with the OpenCode mobile app:%s\n\n' "$DIM" "$RESET"
+  cat "$QR_FILE"
+  printf '\n'
+}
+
+mint_remote_link() {
+  local out link i
+  for i in 1 2 3; do
+    out=$(opencode pair --remote 2>&1) || true
+    link=$(printf '%s\n' "$out" | extract_link)
+    if [ -n "$link" ]; then
+      save_link "$link"
+      capture_qr "$out"
+      printf '%s\n' "${link%%/auth/connect/*}" >"$PUBLIC_FILE"
+      printf '%s\n' "$link"
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+ensure_remote_link() {
+  local out link
+  link=""
+  if ! remote_enabled; then
+    info "enabling OpenTunnel remote access (OpenCode service restarts)..."
+    out=$(opencode pair --remote --yes 2>&1) || true
+    link=$(printf '%s\n' "$out" | extract_link)
+    detect_service
+    ensure_service
+  fi
+  if [ -z "$link" ]; then
+    link=$(mint_remote_link) || return 1
+  else
+    save_link "$link"
+    capture_qr "$out"
+    printf '%s\n' "${link%%/auth/connect/*}" >"$PUBLIC_FILE"
+  fi
+  printf '%s\n' "$link"
+}
+
+# -------------------------------------------------------------- cloudflare ---
+
+tunnel_pid() {
+  [ -s "$PID_FILE" ] || return 1
+  local pid
+  pid=$(cat "$PID_FILE" 2>/dev/null || true)
+  [[ $pid =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$pid"
+}
+
+tunnel_cmdline() {
+  local pid
+  pid=$(tunnel_pid) || return 1
+  [ -r "/proc/${pid}/cmdline" ] || return 1
+  tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null
+}
+
+tunnel_alive() {
+  local pid cmd url code
+  pid=$(tunnel_pid) || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  cmd=$(tunnel_cmdline) || return 1
+  case $cmd in
+    *cloudflared*) ;;
+    *) return 1 ;;
+  esac
+  case $cmd in
+    *"127.0.0.1:${PORT}"*|*"localhost:${PORT}"*) ;;
+    *) return 1 ;;
+  esac
+  [ -s "$URL_FILE" ] || return 1
+  url=$(cat "$URL_FILE" 2>/dev/null || true)
+  [ -n "$url" ] || return 1
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 "$url/" 2>/dev/null || true)
+  [ -n "$code" ] && [ "$code" != 000 ]
+}
+
+stop_tunnel() {
+  local pid i cmd
+  if pid=$(tunnel_pid); then
+    cmd=$(tunnel_cmdline 2>/dev/null || true)
+    case $cmd in
+      *cloudflared*)
+        if kill -0 "$pid" 2>/dev/null; then
+          kill "$pid" 2>/dev/null || true
+          for i in $(seq 1 25); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.2
+          done
+          kill -9 "$pid" 2>/dev/null || true
+        fi
+        ;;
+    esac
+  fi
+  rm -f "$PID_FILE" "$URL_FILE" "$PROTO_FILE"
+}
+
+start_tunnel() {
+  need cloudflared
+  local url pid i code proto_args=()
+
+  [ "$PROTOCOL" != "auto" ] && proto_args=(--protocol "$PROTOCOL")
+
+  : >"$LOG_FILE"
+  nohup cloudflared tunnel --url "http://127.0.0.1:${PORT}" \
+    --no-autoupdate "${proto_args[@]}" >>"$LOG_FILE" 2>&1 </dev/null &
+  pid=$!
+  printf '%s\n' "$pid" >"$PID_FILE"
+  printf '%s\n' "$PROTOCOL" >"$PROTO_FILE"
+
+  info "waiting for tunnel (up to ${TIMEOUT}s)..."
+  for i in $(seq 1 $((TIMEOUT * 2))); do
+    url=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$LOG_FILE" 2>/dev/null | head -1 || true)
+    [ -n "$url" ] && break
+    if ! kill -0 "$pid" 2>/dev/null; then
+      tail -n 10 "$LOG_FILE" >&2 2>/dev/null || true
+      die "cloudflared exited during startup (log: ${LOG_FILE})"
+    fi
+    sleep 0.5
+  done
+
+  if [ -z "$url" ]; then
+    tail -n 10 "$LOG_FILE" >&2 2>/dev/null || true
+    die "timed out waiting for a tunnel URL (log: ${LOG_FILE})"
+  fi
+  printf '%s\n' "$url" >"$URL_FILE"
+
+  for i in $(seq 1 30); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$url/" 2>/dev/null || true)
+    if [ -n "$code" ] && [ "$code" != 000 ]; then
+      return 0
+    fi
+    sleep 1
+  done
+  die "tunnel ${url} is not reachable yet; check ${LOG_FILE}"
+}
+
+tunnel_url() {
+  [ -s "$URL_FILE" ] || return 1
+  cat "$URL_FILE"
+}
+
+mint_tunnel_link() {
+  local out link i url
+  url=$(tunnel_url) || return 1
+  for i in 1 2 3; do
+    out=$(opencode pair --url "$url" 2>&1) || true
+    link=$(printf '%s\n' "$out" | extract_link)
+    if [ -n "$link" ]; then
+      save_link "$link"
+      capture_qr "$out"
+      printf '%s\n' "$link"
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+# ------------------------------------------------------------------ table ---
+
+ROW_KEYS=()
+ROW_VALS=()
+
+add_row() { ROW_KEYS+=("$1"); ROW_VALS+=("$2"); }
+
+terminal_cols() {
+  local c
+  c=$(tput cols 2>/dev/null || true)
+  if ! [[ $c =~ ^[0-9]+$ ]] || [ "$c" -lt 40 ]; then
+    c=${COLUMNS:-100}
+  fi
+  if ! [[ $c =~ ^[0-9]+$ ]] || [ "$c" -lt 40 ]; then
+    c=100
+  fi
+  printf '%s\n' "$c"
+}
+
+print_table() {
+  local kw=0 vw cols i k seg first
+  for k in "${ROW_KEYS[@]}"; do
+    ((${#k} > kw)) && kw=${#k}
+  done
+  cols=$(terminal_cols)
+  vw=$((cols - kw - 7))
+  [ "$vw" -lt 34 ] && vw=34
+
+  local line_top line_bot
+  printf -v line_top '─%.0s' $(seq 1 $((kw + 2)))
+  printf -v line_bot '─%.0s' $(seq 1 $((vw + 2)))
+
+  printf '%s┌%s┬%s┐%s\n' "$DIM" "$line_top" "$line_bot" "$RESET"
+
+  for i in "${!ROW_KEYS[@]}"; do
+    local -a segs=()
+    while IFS= read -r seg; do segs+=("$seg"); done < <(printf '%s\n' "${ROW_VALS[$i]}" | fold -s -w "$vw")
+    first=1
+    for seg in "${segs[@]}"; do
+      if [ "$first" = 1 ]; then
+        printf '%s│%s %s%-*s%s %s│%s %-*s │%s\n' \
+          "$DIM" "$RESET" "$BOLD" "$kw" "${ROW_KEYS[$i]}" "$RESET" "$DIM" "$RESET" "$vw" "$seg" "$RESET"
+        first=0
+      else
+        printf '%s│%s %-*s %s│%s %-*s │%s\n' \
+          "$DIM" "$RESET" "$kw" "" "$DIM" "$RESET" "$vw" "$seg" "$RESET"
+      fi
+    done
+  done
+
+  printf '%s└%s┴%s┘%s\n' "$DIM" "$line_top" "$line_bot" "$RESET"
+}
+
+# ------------------------------------------------------------------ views --
+
+lan_ip() {
+  ip -4 route get 1.1.1.1 2>/dev/null |
+    sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1
+}
+
+lan_urls() {
+  local out ip
+  out=$(opencode api get /api/info 2>/dev/null |
+    grep -oE '"http://[^"]+"' | tr -d '"' |
+    grep -vE '//(127\.0\.0\.1|0\.0\.0\.0|\[::1?\]|localhost)' || true)
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out" | paste -sd ',' - | sed 's/,/, /g'
+    return 0
+  fi
+  ip=$(lan_ip || true)
+  [ -n "$ip" ] && printf 'http://%s:%s\n' "$ip" "$PORT"
+  return 0
+}
+
+cached_link() {
+  [ -s "$LINK_FILE" ] || return 1
+  cat "$LINK_FILE"
+}
+
+link_remaining() {
+  local ts now left
+  [ -s "$LINK_TS_FILE" ] || { echo 0; return; }
+  ts=$(cat "$LINK_TS_FILE" 2>/dev/null || echo 0)
+  [[ $ts =~ ^[0-9]+$ ]] || ts=0
+  now=$(date +%s)
+  left=$((PAIR_TTL - (now - ts)))
+  [ "$left" -lt 0 ] && left=0
+  echo "$left"
+}
+
+current_mode() {
+  if [ -s "$MODE_FILE" ]; then
+    cat "$MODE_FILE"
+    return
+  fi
+  if tunnel_alive 2>/dev/null; then
+    echo cloudflared
+  else
+    echo opentunnel
+  fi
+}
+
+build_rows() {
+  local view=$1 pid svc_state url link left proto mode
+  ROW_KEYS=()
+  ROW_VALS=()
+  mode=$MODE
+
+  pid=$(service_pid || true)
+  if service_is_up; then
+    svc_state="up${pid:+ (pid $pid)} on ${SVC_HOST}:${PORT}"
+  else
+    svc_state="down"
+  fi
+
+  add_row "OpenCode" "$svc_state"
+  add_row "Local" "http://127.0.0.1:${PORT}"
+
+  if service_is_up &&
+    { [ "$SVC_HOST" = "0.0.0.0" ] || [ "$SVC_HOST" = "::" ] || [ "$SVC_HOST" = ":::" ]; }; then
+    local urls
+    urls=$(lan_urls || true)
+    [ -n "$urls" ] && add_row "LAN" "$urls"
+  fi
+
+  if [ "$mode" = "cloudflared" ]; then
+    if url=$(tunnel_url 2>/dev/null) && tunnel_alive; then
+      proto=$(cat "$PROTO_FILE" 2>/dev/null || echo unknown)
+      pid=$(tunnel_pid || true)
+      add_row "Public" "$url"
+      add_row "Tunnel" "cloudflared${pid:+ (pid $pid)} - protocol ${proto}"
+    else
+      add_row "Public" "not running (run: ${PROG} start --cloudflared)"
+      add_row "Tunnel" "down"
+    fi
+  else
+    if service_is_up && remote_enabled && url=$(remote_url); then
+      add_row "Public" "$url"
+      add_row "Tunnel" "OpenTunnel (managed by OpenCode)"
+    else
+      add_row "Public" "not running (run: ${PROG} start)"
+      add_row "Tunnel" "down"
+    fi
+  fi
+
+  if [ "$view" = "start" ] && [ "$DO_LINK" = 1 ]; then
+    if [ -n "$LINK" ]; then
+      add_row "Login link" "$LINK"
+      add_row "Link TTL" "5 minutes - single use"
+    else
+      add_row "Login link" "could not mint (run: ${PROG} link)"
+    fi
+  else
+    if link=$(cached_link 2>/dev/null); then
+      left=$(link_remaining)
+      if [ "$left" -gt 0 ]; then
+        add_row "Login link" "$link"
+        add_row "Link TTL" "$((left / 60))m $((left % 60))s left - single use"
+      else
+        add_row "Login link" "expired (run: ${PROG} link)"
+      fi
+    else
+      add_row "Login link" "none yet (run: ${PROG} start)"
+    fi
+  fi
+
+  if [ "$view" = "start" ] && [ "$DO_LINK" = 1 ] && [ -n "$LINK" ] && [ "$SHOW_QR" = 1 ]; then
+    add_row "Mobile app" "OpenCode app - scan the QR below"
+  else
+    add_row "Mobile app" "OpenCode app - run: ${PROG} qr"
+  fi
+
+  add_row "Browser session" "30 days per browser"
+  if [ "$mode" = "cloudflared" ]; then
+    add_row "Tunnel log" "$LOG_FILE"
+  else
+    add_row "Commands" "${PROG} link | ${PROG} status | ${PROG} stop"
+  fi
+  [ "$mode" = "cloudflared" ] && add_row "Commands" "${PROG} link | ${PROG} status | ${PROG} stop"
+  return 0
+}
+
+finish_start_view() {
+  local link
+  print_table
+  if [ "$MODE" = "cloudflared" ]; then
+    warn "Cloudflare quick tunnels buffer SSE: the OpenCode web UI will stay on Loading."
+    warn "Use OpenTunnel (default) for browser access."
+  fi
+  if [ "$DO_LINK" = 1 ]; then
+    if link=$(cached_link 2>/dev/null) && [ -n "$link" ] && [ "$(link_remaining)" -gt 0 ]; then
+      printf '\n%sOpen in your browser:%s %s\n' "$DIM" "$RESET" "$link"
+      if [ "$SHOW_QR" = 1 ]; then
+        print_qr || true
+      fi
+    fi
+    printf '%sSingle-use link; expires in 5 minutes. A paired browser stays signed in for 30 days.%s\n' "$DIM" "$RESET"
+  else
+    printf '\n%sNo new login link minted. Run: %s link%s\n' "$DIM" "$PROG" "$RESET"
+  fi
+}
+
+# --------------------------------------------------------------- commands ---
+
+cmd_start() {
+  need opencode
+  need curl
+  init_state
+
+  detect_service
+  apply_config
+  detect_service
+  ensure_service
+  detect_service
+
+  LINK=""
+  if [ "$MODE" = "cloudflared" ]; then
+    need cloudflared
+    if tunnel_alive; then
+      info "reusing running tunnel $(tunnel_url)"
+    else
+      stop_tunnel
+      start_tunnel
+    fi
+    PUBLIC_URL=$(tunnel_url || true)
+    if [ "$DO_LINK" = 1 ]; then
+      LINK=$(mint_tunnel_link || true)
+    fi
+  else
+    LINK=$(ensure_remote_link) || LINK=""
+    PUBLIC_URL=$(remote_url || true)
+    if [ -z "$PUBLIC_URL" ]; then
+      die "OpenTunnel is not ready - run: opencode pair --remote --yes"
+    fi
+  fi
+
+  printf '%s\n' "$MODE" >"$MODE_FILE"
+  build_rows start
+  finish_start_view
+}
+
+cmd_status() {
+  need opencode
+  init_state
+  detect_service
+  MODE=$(current_mode)
+  build_rows status
+  print_table
+}
+
+mint_current_link() {
+  if [ "$MODE" = "cloudflared" ]; then
+    tunnel_alive || { err "no running tunnel - run: ${PROG} start --cloudflared"; return 1; }
+    mint_tunnel_link
+  else
+    ensure_service
+    detect_service
+    ensure_remote_link
+  fi
+}
+
+cmd_link() {
+  need opencode
+  need curl
+  init_state
+  detect_service
+  MODE=$(current_mode)
+
+  local link
+  link=$(mint_current_link) || die "could not mint a pairing link"
+  printf '%s\n\n%sone-time use - expires in 5 minutes%s\n' "$link" "$DIM" "$RESET"
+  if [ "$SHOW_QR" = 1 ]; then
+    print_qr || true
+  fi
+}
+
+cmd_qr() {
+  need opencode
+  need curl
+  init_state
+  detect_service
+  MODE=$(current_mode)
+
+  local link
+  link=$(mint_current_link) || die "could not mint a pairing link"
+  printf '%s\n\n' "$link"
+  print_qr || die "could not render a QR code (opencode pair printed none)"
+  printf '%sSingle-use link; expires in 5 minutes. The app stays paired for 30 days.%s\n' "$DIM" "$RESET"
+}
+
+cmd_restart() {
+  init_state
+  detect_service
+  local mode
+  mode=$(current_mode)
+  if [ "$mode" = "cloudflared" ]; then
+    stop_tunnel
+    MODE=cloudflared
+  else
+    MODE=opentunnel
+  fi
+  cmd_start
+}
+
+cmd_stop() {
+  init_state
+  detect_service
+  stop_tunnel
+
+  if remote_enabled; then
+    info "disabling OpenTunnel remote access..."
+    opencode service set remote false >/dev/null 2>&1 || true
+    if [ "$WANT_ALL" = 1 ]; then
+      say "remote access disabled, OpenCode service stopped"
+    else
+      info "restarting local OpenCode service..."
+      opencode service start >/dev/null 2>&1 || true
+      local i
+      for i in $(seq 1 60); do
+        service_is_up && break
+        sleep 0.5
+      done
+      if service_is_up; then
+        say "remote access disabled, local OpenCode service running"
+      else
+        say "remote access disabled (service is stopped; run: opencode service start)"
+      fi
+    fi
+  else
+    say "no remote tunnel was active (OpenCode service still running)"
+  fi
+
+  rm -f "$LINK_FILE" "$LINK_TS_FILE" "$PUBLIC_FILE" "$MODE_FILE"
+}
+
+cmd_logs() {
+  init_state
+  detect_service
+  local mode log
+  mode=$(current_mode)
+  if [ "$mode" = "cloudflared" ] && [ -f "$LOG_FILE" ]; then
+    exec tail -n 50 -f "$LOG_FILE"
+  fi
+  log=$HOME/.local/share/opencode/log/opencode.log
+  [ -f "$log" ] || die "no log found at ${log}"
+  exec tail -n 50 -f "$log"
+}
+
+# ------------------------------------------------------------------- main --
+
+if [ $# -eq 0 ]; then
+  usage
+  exit 0
+fi
+
+CMD=$1
+shift
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    --cloudflared) MODE=cloudflared; shift ;;
+    --tunnel)
+      [ $# -ge 2 ] || die "--tunnel needs a value"
+      MODE=$2
+      case $MODE in
+        opentunnel | cloudflared) ;;
+        *) die "invalid tunnel: $MODE (opentunnel|cloudflared)" ;;
+      esac
+      shift 2
+      ;;
+    --protocol)
+      [ $# -ge 2 ] || die "--protocol needs a value"
+      PROTOCOL=$2
+      case $PROTOCOL in
+        auto | http2 | quic) ;;
+        *) die "invalid protocol: $PROTOCOL (auto|http2|quic)" ;;
+      esac
+      shift 2
+      ;;
+    --timeout)
+      [ $# -ge 2 ] || die "--timeout needs a value"
+      TIMEOUT=$2
+      [[ $TIMEOUT =~ ^[0-9]+$ ]] || die "--timeout must be a number"
+      shift 2
+      ;;
+    --port)
+      [ $# -ge 2 ] || die "--port needs a value"
+      PORT_WANT=$2
+      [[ $PORT_WANT =~ ^[0-9]+$ ]] || die "--port must be a number"
+      shift 2
+      ;;
+    --lan) WANT_LAN=1; shift ;;
+    --no-link) DO_LINK=0; shift ;;
+    --qr) DO_QR=on; shift ;;
+    --no-qr) DO_QR=off; shift ;;
+    --all) WANT_ALL=1; shift ;;
+    -h | --help) usage; exit 0 ;;
+    *) die "unknown option: $1 (try: ${PROG} help)" ;;
+  esac
+done
+
+case $DO_QR in
+  on) SHOW_QR=1 ;;
+  off) SHOW_QR=0 ;;
+  auto)
+    if [ -t 1 ]; then SHOW_QR=1; else SHOW_QR=0; fi
+    ;;
+esac
+
+case $CMD in
+  start) lock_state; cmd_start ;;
+  status) lock_state; cmd_status ;;
+  link) lock_state; cmd_link ;;
+  qr) lock_state; cmd_qr ;;
+  restart) lock_state; cmd_restart ;;
+  stop) lock_state; cmd_stop ;;
+  logs) cmd_logs ;;
+  help | -h | --help) usage ;;
+  *) die "unknown command: ${CMD} (try: ${PROG} help)" ;;
+esac
